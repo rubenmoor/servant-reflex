@@ -20,6 +20,7 @@ import           Data.Bifunctor             (first)
 import qualified Data.ByteString.Builder    as Builder
 import qualified Data.ByteString.Lazy.Char8 as BL
 import           Data.ByteString            (ByteString)
+import           Data.Functor               ((<&>))
 import qualified Data.Map                   as Map
 import           Data.Maybe                 (catMaybes, fromMaybe)
 import           Data.Functor.Compose
@@ -28,10 +29,11 @@ import           Data.Proxy                 (Proxy(..))
 import           Data.Text                  (Text)
 import qualified Data.Text                  as T
 import qualified Data.Text.Encoding         as TE
-import           Data.Traversable           (forM)
+import           Data.Traversable           (forM, for)
 import           Language.Javascript.JSaddle.Monad (JSM, MonadJSM, liftJSM)
 import qualified Network.URI                as N
 import           Reflex.Dom.Core                 hiding (tag)
+import           Safe (atMay)
 import           Servant.Common.BaseUrl     (BaseUrl, showBaseUrl,
                                              SupportsServantReflex)
 import           Servant.API.ContentTypes   (MimeUnrender(..), NoContent(..))
@@ -146,7 +148,7 @@ data Req t = Req
   , reqPathParts :: [Dynamic t (Either Text Text)]
   , qParams      :: [(Text, QueryPart t)]
   , reqBody      :: Maybe (Dynamic t (Either Text (BL.ByteString, Text)))
-  , headers      :: [(Text, Dynamic t (Either Text Text))]
+  , headers      :: [(Text, Dynamic t (Either Text (Maybe Text)))]
   , respHeaders  :: XhrResponseHeaders
   , authData     :: Maybe (Dynamic t (Maybe BasicAuthData))
   }
@@ -158,9 +160,31 @@ prependToPathParts :: Dynamic t (Either Text Text) -> Req t -> Req t
 prependToPathParts p req =
   req { reqPathParts = p : reqPathParts req }
 
-addHeader :: (ToHttpApiData a, Reflex t) => Text -> Dynamic t (Either Text a) -> Req t -> Req t
-addHeader name val req = req { headers = (name, (fmap . fmap) (TE.decodeUtf8 . toHeader) val) : headers req }
+addHeader
+    :: ( ToHttpApiData a
+       , Reflex t
+       )
+    => Text
+    -> Dynamic t (Either Text a)
+    -> Req t
+    -> Req t
+addHeader name val req =
+  req { headers =
+          (name, (fmap . fmap) (Just . TE.decodeUtf8 . toHeader) val) : headers req
+      }
 
+addHeaderOptional
+    :: ( ToHttpApiData a
+       , Reflex t
+       )
+    => Text
+    -> Dynamic t (Either Text (Maybe a))
+    -> Req t
+    -> Req t
+addHeaderOptional name val req =
+  req { headers =
+          (name, (fmap . fmap . fmap) (TE.decodeUtf8 . toHeader) val) : headers req
+      }
 
 reqToReflexRequest
     :: forall t. Reflex t
@@ -202,7 +226,7 @@ reqToReflexRequest reqMeth reqHost req =
 
       queryPartStrings :: [Dynamic t (Maybe (Either Text Text))]
       queryPartStrings = map queryPartString (qParams req)
-      queryPartStrings' = fmap (sequence . catMaybes) $ sequence queryPartStrings :: Dynamic t (Either Text [Text])
+      queryPartStrings' = sequence . catMaybes <$> sequence queryPartStrings :: Dynamic t (Either Text [Text])
       queryString :: Dynamic t (Either Text Text) =
         ffor queryPartStrings' $ \qs -> fmap (T.intercalate "&") qs
       xhrUrl =  (liftA3 . liftA3) (\a p q -> a </> if T.null q then p else p <> "?" <> q)
@@ -214,13 +238,13 @@ reqToReflexRequest reqMeth reqHost req =
 
 
       xhrHeaders :: Dynamic t (Either Text [(Text, Text)])
-      xhrHeaders = (fmap sequence . sequence . fmap f . headers) req
+      xhrHeaders = (fmap (fmap catMaybes) . fmap sequence . sequence . fmap f . headers) req
         where
-          f = \(headerName, dynam) ->
-                fmap (fmap (\rightVal -> (headerName, rightVal))) dynam
+          f = \(headerName, dynHeaderContent) ->
+                fmap (fmap (fmap (headerName,))) dynHeaderContent
 
       mkConfigBody :: Either Text [(Text,Text)]
-                   -> (Either Text (BL.ByteString, Text))
+                   -> Either Text (BL.ByteString, Text)
                    -> Either Text (XhrRequestConfig XhrPayload)
       mkConfigBody ehs rb = case (ehs, rb) of
                   (_, Left e)                     -> Left e
